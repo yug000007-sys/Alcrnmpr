@@ -1,57 +1,69 @@
 import io
 import re
 import zipfile
-from typing import Dict, List, Tuple
-
-import pandas as pd
 import streamlit as st
+import pandas as pd
 import pdfplumber
 
-# =========================
-# AUTH (your requested creds)
-# =========================
+from openpyxl import load_workbook
+from openpyxl.styles import Alignment, Font
+from openpyxl.utils import get_column_letter
+
+# -----------------------------
+# AUTH
+# -----------------------------
 USERNAME = "matt"
 PASSWORD = "Interlynx123"
 
-# =========================
-# OUTPUT HEADER (EXACT)
-# =========================
+if "auth" not in st.session_state:
+    st.session_state.auth = False
+
+if not st.session_state.auth:
+    st.title("Alcorn PDF Extractor — Login")
+    u = st.text_input("Username")
+    p = st.text_input("Password", type="password")
+    if st.button("Login"):
+        if u == USERNAME and p == PASSWORD:
+            st.session_state.auth = True
+            st.rerun()
+        else:
+            st.error("Invalid username or password.")
+    st.stop()
+
+st.title("Alcorn PDF → Excel (Auto-Formatted)")
+
+# -----------------------------
+# EXACT HEADER REQUIRED
+# -----------------------------
 OUTPUT_COLUMNS = [
-    "ReferralManagerCode", "ReferralManager", "ReferralEmail", "Brand", "QuoteNumber",
-    "QuoteVersion", "QuoteDate", "QuoteValidDate", "Customer Number/ID", "Company",
-    "Address", "County", "City", "State", "ZipCode", "Country", "FirstName", "LastName",
-    "ContactEmail", "ContactPhone", "Webaddress", "item_id", "item_desc", "UOM", "Quantity",
-    "Unit Price", "List Price", "TotalSales", "Manufacturer_ID", "manufacturer_Name",
-    "Writer Name", "CustomerPONumber", "PDF", "DemoQuote", "Duns", "SIC", "NAICS",
-    "LineOfBusiness", "LinkedinProfile", "PhoneResearched", "PhoneSupplied", "ParentName"
+    "ReferralManagerCode","ReferralManager","ReferralEmail","Brand","QuoteNumber","QuoteVersion",
+    "QuoteDate","QuoteValidDate","Customer Number/ID","Company","Address","County","City","State",
+    "ZipCode","Country","FirstName","LastName","ContactEmail","ContactPhone","Webaddress","item_id",
+    "item_desc","UOM","Quantity","Unit Price","List Price","TotalSales","Manufacturer_ID",
+    "manufacturer_Name","Writer Name","CustomerPONumber","PDF","DemoQuote","Duns","SIC","NAICS",
+    "LineOfBusiness","LinkedinProfile","PhoneResearched","PhoneSupplied","ParentName"
 ]
 
 US_STATE_RE = r"(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|IA|ID|IL|IN|KS|KY|LA|MA|MD|ME|MI|MN|MO|MS|MT|NC|ND|NE|NH|NJ|NM|NV|NY|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VA|VT|WA|WI|WV|WY|DC)"
 CAN_POSTAL_RE = r"\b([A-Z]\d[A-Z]\s?\d[A-Z]\d)\b"
-
 MONEY_RE = re.compile(r"\d{1,3}(?:,\d{3})*\.\d{2}")
 
-def make_empty_row() -> Dict[str, str]:
+def make_row():
     return {c: "" for c in OUTPUT_COLUMNS}
 
-def normalize_text(x) -> str:
-    if x is None or (isinstance(x, float) and pd.isna(x)):
-        return ""
-    return str(x).strip().replace("\u00a0", " ")
+def norm(s):
+    return "" if s is None else str(s).strip().replace("\u00a0"," ")
 
-def normalize_quote(x) -> str:
-    s = normalize_text(x)
-    s = s.replace("'", "").replace('"', "")
-    return s.upper()
+def quote_norm(s):
+    return norm(s).replace("'", "").replace('"', "").upper()
 
-def to_mmddyyyy(val: str) -> str:
-    s = normalize_text(val)
+def to_mmddyyyy(val):
+    s = norm(val)
     if not s:
         return ""
     dt = pd.to_datetime(s, errors="coerce", infer_datetime_format=True)
     if pd.notna(dt):
         return dt.strftime("%m/%d/%Y")
-    # Handle "Nov 21, 2025"
     m = re.search(r"\b([A-Za-z]{3,9})\s+(\d{1,2}),\s*(\d{4})\b", s)
     if m:
         mon = m.group(1).lower()[:3]
@@ -60,85 +72,72 @@ def to_mmddyyyy(val: str) -> str:
             return f"{mon_map[mon]:02d}/{int(m.group(2)):02d}/{int(m.group(3))}"
     return s
 
-def money_to_float(s: str) -> float:
-    t = normalize_text(s).replace(",", "")
+def money_float(s):
+    t = norm(s).replace(",", "")
     try:
         return float(t)
     except:
         return 0.0
 
-def read_entries_excel(uploaded) -> pd.DataFrame:
-    uploaded.seek(0)
-    df = pd.read_excel(uploaded, dtype=str, keep_default_na=False)
-    df.columns = [c.strip() for c in df.columns]
-
-    # Force exact output columns (keep anything extra out)
-    for col in OUTPUT_COLUMNS:
-        if col not in df.columns:
-            df[col] = ""
-    df = df[OUTPUT_COLUMNS].copy()
-
-    # Normalize key columns
-    df["QuoteNumber"] = df["QuoteNumber"].apply(normalize_quote)
-    df["Customer Number/ID"] = df["Customer Number/ID"].astype(str).str.strip()
-    df["ReferralManagerCode"] = df["ReferralManagerCode"].astype(str).str.strip()
-
-    # Ensure numeric-ish are still text unless you want otherwise
-    df["QuoteDate"] = df["QuoteDate"].apply(to_mmddyyyy)
-    df["QuoteValidDate"] = df["QuoteValidDate"].apply(to_mmddyyyy)
-
-    return df
-
-def pdf_full_text(pdf_bytes: bytes) -> str:
+def pdf_text(pdf_bytes):
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        chunks = []
+        parts = []
         for p in pdf.pages:
             t = p.extract_text() or ""
             if t.strip():
-                chunks.append(t)
-        return "\n".join(chunks)
+                parts.append(t)
+        return "\n".join(parts)
 
-def extract_ship_to_block(text: str) -> Dict[str, str]:
-    """
-    Extract Ship To (Company + Address lines).
-    Your PDFs show Ship To block repeated; we take first Ship To block.
-    """
+def extract_header(text):
+    out = {
+        "ReferralManagerCode": "",
+        "QuoteNumber": "",
+        "QuoteDate": "",
+        "Customer Number/ID": "",
+        "Brand": "Alcorn Industrial Inc",
+    }
+
+    m = re.search(r"\bOrder Number\s*(QT[0-9A-Z]+)\b", text, flags=re.IGNORECASE)
+    out["QuoteNumber"] = quote_norm(m.group(1)) if m else quote_norm(re.search(r"\b(QT[0-9A-Z]+)\b", text, re.IGNORECASE).group(1)) if re.search(r"\b(QT[0-9A-Z]+)\b", text, re.IGNORECASE) else ""
+
+    md = re.search(r"\bDate\s*([A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})\b", text, flags=re.IGNORECASE)
+    out["QuoteDate"] = to_mmddyyyy(md.group(1)) if md else ""
+
+    mc = re.search(r"\bCustomer No\.\s*([0-9A-Z\-]+)\b", text, flags=re.IGNORECASE)
+    out["Customer Number/ID"] = norm(mc.group(1)) if mc else ""
+
+    ms = re.search(r"\bSalesperson\s*([A-Z]{2,3})\b", text)
+    out["ReferralManagerCode"] = norm(ms.group(1)) if ms else ""
+
+    return out
+
+def extract_ship_to(text):
     out = {"Company":"", "Address":"", "City":"", "State":"", "ZipCode":"", "Country":""}
-
-    m = re.search(r"Ship To:\s*\n(.*?)(?:\nCustomer\s*\nItem Number|\nCustomer\s+Item Number|\nPlease send your order|\nTax Summary:)",
+    m = re.search(r"Ship To:\s*\n(.*?)(?:\nCustomer\s+Item Number|\nCustomer Item Number|\nPlease send your order|\nTax Summary:)",
                   text, flags=re.IGNORECASE | re.DOTALL)
     if not m:
         return out
-
     block = m.group(1).strip()
     lines = [l.strip() for l in block.splitlines() if l.strip()]
-
     if not lines:
         return out
 
-    # Company = first line (blue)
     out["Company"] = lines[0]
 
-    # Street = first line containing a digit after company (brown)
-    street = ""
-    cityline = ""
-    country = ""
+    street, cityline, country = "", "", ""
     for l in lines[1:]:
         if not street and re.search(r"\d", l):
             street = l
             continue
-        # City line often has "City, ST ..." or "City, QC J7E4K9"
         if not cityline and ("," in l) and (re.search(r"\b[A-Z]{2}\b", l) or re.search(CAN_POSTAL_RE, l)):
             cityline = l
             continue
         if l.lower() in ("canada", "usa", "united states", "united states of america"):
             country = "Canada" if "canada" in l.lower() else "USA"
-
     out["Address"] = street
     out["Country"] = country
 
     if cityline:
-        # Canada: "Sainte Therese, QC J7E4K9" or "Sainte Therese, QC, J7E4K9"
         mca = re.search(r"^(.*?),\s*([A-Z]{2})\s*,?\s*([A-Z]\d[A-Z]\s?\d[A-Z]\d)\s*$", cityline)
         if mca:
             out["City"] = mca.group(1).strip()
@@ -150,155 +149,174 @@ def extract_ship_to_block(text: str) -> Dict[str, str]:
                 out["City"] = mus.group(1).strip()
                 out["State"] = mus.group(2).strip()
                 out["ZipCode"] = mus.group(3).strip()
-
     return out
 
-def extract_header_fields(text: str) -> Dict[str, str]:
-    """
-    Based on your real PDFs:
-    - "Order Number QTxxxxx"
-    - "Date Nov 21, 2025"
-    - "Customer No. 11007-4"
-    - "Salesperson JZ"
-    """
-    out = {
-        "QuoteNumber": "",
-        "QuoteDate": "",
-        "Customer Number/ID": "",
-        "ReferralManagerCode": "",
-        "Brand": "Alcorn Industrial Inc",
-    }
-
-    m = re.search(r"\bOrder Number\s*(QT[0-9A-Z]+)\b", text, flags=re.IGNORECASE)
-    if m:
-        out["QuoteNumber"] = normalize_quote(m.group(1))
-    else:
-        m2 = re.search(r"\b(QT[0-9A-Z]+)\b", text, flags=re.IGNORECASE)
-        if m2:
-            out["QuoteNumber"] = normalize_quote(m2.group(1))
-
-    md = re.search(r"\bDate\s*([A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})\b", text, flags=re.IGNORECASE)
-    if md:
-        out["QuoteDate"] = to_mmddyyyy(md.group(1))
-
-    mc = re.search(r"\bCustomer No\.\s*([0-9A-Z\-]+)\b", text, flags=re.IGNORECASE)
-    if mc:
-        out["Customer Number/ID"] = normalize_text(mc.group(1))
-
-    ms = re.search(r"\bSalesperson\s*([A-Z]{2,3})\b", text)
-    if ms:
-        out["ReferralManagerCode"] = normalize_text(ms.group(1))
-
-    return out
-
-def looks_like_item_code(tok: str) -> bool:
+def looks_like_item(tok):
     t = tok.strip()
-    if not t:
-        return False
-    # Alcorn customer item numbers often contain "-" (ALCJA-13ST, 273711-0B07)
     if "-" in t and any(ch.isdigit() for ch in t):
         return True
-    # Some can be like IEC4EGV or 24320: alnum with digits, length >= 4
     if len(t) >= 4 and any(ch.isdigit() for ch in t) and any(ch.isalpha() for ch in t):
         return True
-    # Pure digits (24320) also can be item codes
     if t.isdigit() and len(t) >= 4:
         return True
     return False
 
-def extract_line_items(text: str) -> List[Dict[str, object]]:
-    """
-    Extract between "Please send your order to:" and "Tax Summary:"
-    Handles wrapped lines: if a line doesn't start with qty, it appends to previous description.
-    """
-    items: List[Dict[str, object]] = []
-
-    # Isolate item block
+def extract_items(text):
     m = re.search(r"Please send your order to:.*?\n(.*?)(?:\nTax Summary:)", text, flags=re.IGNORECASE | re.DOTALL)
     if not m:
-        return items
+        return []
+    lines = [l.strip() for l in m.group(1).splitlines() if l.strip()]
 
-    block = m.group(1).strip()
-    lines = [l.strip() for l in block.splitlines() if l.strip()]
-
+    items = []
     current = None
     for line in lines:
-        # New row starts with qty integer
         if re.match(r"^\d+\s+", line):
             if current:
-                current["item_desc"] = normalize_text(current["item_desc"])
+                current["item_desc"] = current["item_desc"].strip()
                 items.append(current)
-            # Pull money at end: unit + extended are usually last 2 money values
+
             monies = MONEY_RE.findall(line)
             unit = monies[-2] if len(monies) >= 2 else ""
             ext = monies[-1] if len(monies) >= 1 else ""
 
-            # Remove trailing money strings for parsing tokens
-            line_wo_money = line
+            line_wo = line
             if ext:
-                line_wo_money = line_wo_money.rsplit(ext, 1)[0].strip()
+                line_wo = line_wo.rsplit(ext, 1)[0].strip()
             if unit:
-                line_wo_money = line_wo_money.rsplit(unit, 1)[0].strip()
+                line_wo = line_wo.rsplit(unit, 1)[0].strip()
 
-            tokens = line_wo_money.split()
-            qty = tokens[0]
-            rest = tokens[1:]
+            toks = line_wo.split()
+            qty = toks[0]
+            rest = toks[1:]
 
-            # Find item_id token (light green mapping)
-            idx_code = None
+            idx = None
             for i, tok in enumerate(rest):
-                if looks_like_item_code(tok):
-                    idx_code = i
+                if looks_like_item(tok):
+                    idx = i
                     break
 
-            item_id = rest[idx_code] if idx_code is not None else ""
-            desc = " ".join(rest[idx_code+1:]).strip() if idx_code is not None else " ".join(rest).strip()
+            item_id = rest[idx] if idx is not None else ""
+            desc = " ".join(rest[idx+1:]).strip() if idx is not None else " ".join(rest).strip()
 
             current = {
                 "Quantity": qty,
                 "item_id": item_id,
                 "item_desc": desc,
-                "Unit Price": money_to_float(unit),
-                "TotalSales": money_to_float(ext),
+                "Unit Price": money_float(unit),
+                "TotalSales": money_float(ext),
             }
         else:
-            # wrapped line -> append to description
             if current:
-                current["item_desc"] = f"{current['item_desc']} {line}".strip()
+                current["item_desc"] += " " + line
 
     if current:
-        current["item_desc"] = normalize_text(current["item_desc"])
+        current["item_desc"] = current["item_desc"].strip()
         items.append(current)
 
-    # Remove empties
-    items = [it for it in items if it.get("item_id") or it.get("item_desc")]
-    return items
+    return [it for it in items if it.get("item_id") or it.get("item_desc")]
 
-def build_extracted_df(pdfs: List) -> Tuple[pd.DataFrame, bytes, bytes]:
+def auto_format_excel(xlsx_bytes: bytes) -> bytes:
     """
-    Returns:
-      - extracted rows as DataFrame (OUTPUT_COLUMNS)
-      - excel bytes
-      - renamed PDFs zip bytes
+    Formats:
+    - Freeze header row, add filter
+    - Force TEXT columns (IDs)
+    - Date format MM/DD/YYYY
+    - Currency columns
+    - Column widths
     """
+    from openpyxl import load_workbook
+    from openpyxl.styles import Alignment, Font
+    from openpyxl.utils import get_column_letter
+
+    wb = load_workbook(io.BytesIO(xlsx_bytes))
+    ws = wb.active
+
+    # Freeze & filter
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+
+    header_font = Font(bold=True)
+    for cell in ws[1]:
+        cell.font = header_font
+        cell.alignment = Alignment(wrap_text=True, vertical="center")
+
+    # Column categories
+    TEXT_COLS = {
+        "ReferralManagerCode","QuoteNumber","QuoteVersion","Customer Number/ID","ZipCode",
+        "item_id","Manufacturer_ID","Duns","SIC","NAICS","CustomerPONumber","PDF"
+    }
+    DATE_COLS = {"QuoteDate","QuoteValidDate"}
+    CURR_COLS = {"Unit Price","List Price","TotalSales"}
+    NUM_COLS = {"Quantity"}
+
+    # Map header -> col index
+    header_map = {}
+    for j, c in enumerate(ws[1], start=1):
+        header_map[str(c.value).strip()] = j
+
+    # Apply formats row by row
+    max_row = ws.max_row
+    for col_name, j in header_map.items():
+        col_letter = get_column_letter(j)
+
+        if col_name in TEXT_COLS:
+            # Force text
+            for r in range(2, max_row + 1):
+                ws[f"{col_letter}{r}"].number_format = "@"
+
+        if col_name in DATE_COLS:
+            for r in range(2, max_row + 1):
+                ws[f"{col_letter}{r}"].number_format = "mm/dd/yyyy"
+
+        if col_name in CURR_COLS:
+            for r in range(2, max_row + 1):
+                ws[f"{col_letter}{r}"].number_format = '"$"#,##0.00'
+
+        if col_name in NUM_COLS:
+            for r in range(2, max_row + 1):
+                ws[f"{col_letter}{r}"].number_format = "0"
+
+        # Width heuristic
+        ws.column_dimensions[col_letter].width = min(45, max(12, len(col_name) + 2))
+
+    # Make description wider
+    if "item_desc" in header_map:
+        ws.column_dimensions[get_column_letter(header_map["item_desc"])].width = 55
+    if "Company" in header_map:
+        ws.column_dimensions[get_column_letter(header_map["Company"])].width = 35
+    if "Address" in header_map:
+        ws.column_dimensions[get_column_letter(header_map["Address"])].width = 35
+
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out.getvalue()
+
+# ---------------- UI ----------------
+pdfs = st.file_uploader("Upload Alcorn Quote PDFs (up to 100)", type=["pdf"], accept_multiple_files=True)
+
+if st.button("Extract + Auto-Format Excel"):
+    if not pdfs:
+        st.error("Please upload at least 1 PDF.")
+        st.stop()
+
     rows = []
-    renamed_pdfs: List[Tuple[str, bytes]] = []
+    renamed = []
 
     for f in pdfs:
         pdf_bytes = f.read()
-        text = pdf_full_text(pdf_bytes)
+        text = pdf_text(pdf_bytes)
 
-        header = extract_header_fields(text)
-        ship = extract_ship_to_block(text)
+        header = extract_header(text)
+        ship = extract_ship_to(text)
+        items = extract_items(text)
 
-        quote = normalize_quote(header.get("QuoteNumber") or f.name.replace(".pdf", ""))
+        quote = quote_norm(header.get("QuoteNumber") or f.name.replace(".pdf",""))
         pdf_name = f"{quote}.pdf"
+        renamed.append((pdf_name, pdf_bytes))
 
-        renamed_pdfs.append((pdf_name, pdf_bytes))
-
-        items = extract_line_items(text)
         for it in items:
-            r = make_empty_row()
+            r = make_row()
             r["Brand"] = header.get("Brand", "Alcorn Industrial Inc")
             r["QuoteNumber"] = quote
             r["QuoteDate"] = header.get("QuoteDate", "")
@@ -312,151 +330,45 @@ def build_extracted_df(pdfs: List) -> Tuple[pd.DataFrame, bytes, bytes]:
             r["ZipCode"] = ship.get("ZipCode", "")
             r["Country"] = ship.get("Country", "")
 
-            r["item_id"] = normalize_text(it.get("item_id", ""))
-            r["item_desc"] = normalize_text(it.get("item_desc", ""))
-            r["Quantity"] = normalize_text(it.get("Quantity", ""))
-            r["Unit Price"] = it.get("Unit Price", "")
-            r["TotalSales"] = it.get("TotalSales", "")
+            r["item_id"] = norm(it.get("item_id",""))
+            r["item_desc"] = norm(it.get("item_desc",""))
+            r["Quantity"] = norm(it.get("Quantity",""))
+            r["Unit Price"] = it.get("Unit Price", 0.0)
+            r["TotalSales"] = it.get("TotalSales", 0.0)
 
             r["PDF"] = pdf_name
             rows.append(r)
 
     df = pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
+    st.success(f"Extracted rows: {len(df)}")
+    st.dataframe(df.head(25), height=260, use_container_width=True)
 
-    # Excel bytes
-    excel_buf = io.BytesIO()
-    with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
+    # Write Excel
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Extracted")
-    excel_buf.seek(0)
+    buf.seek(0)
 
-    # ZIP bytes
-    zip_buf = io.BytesIO()
-    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for name, b in renamed_pdfs:
+    # Auto-format
+    formatted = auto_format_excel(buf.getvalue())
+
+    st.download_button(
+        "Download Auto-Formatted Excel",
+        data=formatted,
+        file_name="alcorn_extracted_autoformatted.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    # Renamed PDFs ZIP
+    zbuf = io.BytesIO()
+    with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, b in renamed:
             z.writestr(name, b)
-    zip_buf.seek(0)
+    zbuf.seek(0)
 
-    return df, excel_buf.getvalue(), zip_buf.getvalue()
-
-def merge_extracted_into_entries(entries: pd.DataFrame, extracted: pd.DataFrame) -> pd.DataFrame:
-    """
-    Merge strategy:
-    - Match QuoteNumber
-    - For line items: match QuoteNumber + item_id + Quantity + Unit Price + TotalSales
-    - Fill blanks in entries from extracted
-    - Append any extracted rows not matched
-    """
-    ent = entries.copy()
-    ext = extracted.copy()
-
-    # Normalize keys
-    ent["QuoteNumber"] = ent["QuoteNumber"].apply(normalize_quote)
-    ext["QuoteNumber"] = ext["QuoteNumber"].apply(normalize_quote)
-
-    def key_df(df: pd.DataFrame) -> pd.Series:
-        return (
-            df["QuoteNumber"].astype(str).fillna("") + "||" +
-            df["item_id"].astype(str).fillna("") + "||" +
-            df["Quantity"].astype(str).fillna("") + "||" +
-            df["Unit Price"].astype(str).fillna("") + "||" +
-            df["TotalSales"].astype(str).fillna("")
-        )
-
-    ent["_k"] = key_df(ent)
-    ext["_k"] = key_df(ext)
-
-    ext_map = ext.set_index("_k", drop=False)
-
-    # Fill blanks in entries for matched keys
-    fill_cols = [c for c in OUTPUT_COLUMNS if c not in ("QuoteNumber", "item_id", "Quantity", "Unit Price", "TotalSales")]
-    for i, row in ent.iterrows():
-        k = row["_k"]
-        if k in ext_map.index:
-            src = ext_map.loc[k]
-            # if duplicate keys in extracted (rare), take first
-            if isinstance(src, pd.DataFrame):
-                src = src.iloc[0]
-            for col in fill_cols:
-                if normalize_text(ent.at[i, col]) == "" and normalize_text(src.get(col, "")) != "":
-                    ent.at[i, col] = src.get(col, "")
-
-    # Append extracted rows not present in entries
-    ent_keys = set(ent["_k"].tolist())
-    ext_new = ext[~ext["_k"].isin(ent_keys)].copy()
-
-    out = pd.concat([ent.drop(columns=["_k"]), ext_new.drop(columns=["_k"])], ignore_index=True)
-    out = out[OUTPUT_COLUMNS].copy()
-    return out
-
-# =========================
-# UI
-# =========================
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-
-if not st.session_state.authenticated:
-    st.title("Alcorn PDF → Excel Mapper — Login")
-    u = st.text_input("Username")
-    p = st.text_input("Password", type="password")
-    if st.button("Login"):
-        if u == USERNAME and p == PASSWORD:
-            st.session_state.authenticated = True
-            st.rerun()
-        else:
-            st.error("Invalid username or password.")
-    st.stop()
-
-st.title("Alcorn PDF → Excel Mapper")
-
-c1, c2 = st.columns(2)
-with c1:
-    entries_file = st.file_uploader("Step 1 — Upload Excel Entries (your header)", type=["xlsx"], key="entries")
-with c2:
-    pdfs = st.file_uploader("Step 2 — Upload Alcorn PDFs (up to 100)", type=["pdf"], accept_multiple_files=True, key="pdfs")
-
-run = st.button("Run Mapping")
-
-if run:
-    if not entries_file or not pdfs:
-        st.error("Please upload BOTH the Excel entries file and the PDFs.")
-        st.stop()
-
-    try:
-        entries_df = read_entries_excel(entries_file)
-        extracted_df, extracted_excel_bytes, renamed_zip_bytes = build_extracted_df(pdfs)
-
-        final_df = merge_extracted_into_entries(entries_df, extracted_df)
-
-        st.success(f"PDF rows extracted: {len(extracted_df)} | Final rows: {len(final_df)}")
-        st.dataframe(final_df.head(25), use_container_width=True, height=260)
-
-        # Download final mapped file
-        out_buf = io.BytesIO()
-        with pd.ExcelWriter(out_buf, engine="openpyxl") as writer:
-            final_df.to_excel(writer, index=False, sheet_name="Mapped")
-        out_buf.seek(0)
-
-        st.download_button(
-            "Download Mapped Excel",
-            data=out_buf.getvalue(),
-            file_name="alcorn_mapped.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
-        # Optional downloads
-        st.download_button(
-            "Download Extracted-only Excel",
-            data=extracted_excel_bytes,
-            file_name="alcorn_extracted_only.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
-        st.download_button(
-            "Download Renamed PDFs (ZIP)",
-            data=renamed_zip_bytes,
-            file_name="alcorn_renamed_pdfs.zip",
-            mime="application/zip",
-        )
-
-    except Exception as e:
-        st.error("Processing failed. Please verify the Excel header matches exactly and PDFs are Alcorn format.")
+    st.download_button(
+        "Download Renamed PDFs (ZIP)",
+        data=zbuf.getvalue(),
+        file_name="alcorn_renamed_pdfs.zip",
+        mime="application/zip",
+    )
