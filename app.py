@@ -39,57 +39,145 @@ def money(val):
 
 def format_date(text):
     try:
-        return datetime.strptime(text, "%b %d, %Y").strftime("%m/%d/%Y")
+        return datetime.strptime(text.strip(), "%b %d, %Y").strftime("%m/%d/%Y")
     except:
         return ""
 
-def safe_text(s):
-    return (s or "").strip()
+def group_words_into_lines(words, y_tol=3):
+    """Group pdfplumber words into text lines using y coordinate clustering."""
+    if not words:
+        return []
+    words = sorted(words, key=lambda w: (w["top"], w["x0"]))
+    lines = []
+    current = [words[0]]
+    for w in words[1:]:
+        if abs(w["top"] - current[-1]["top"]) <= y_tol:
+            current.append(w)
+        else:
+            lines.append(current)
+            current = [w]
+    lines.append(current)
+    out = []
+    for ln in lines:
+        ln = sorted(ln, key=lambda w: w["x0"])
+        out.append(" ".join(w["text"] for w in ln).strip())
+    return [x for x in out if x]
+
+def find_word(words, target, case_insensitive=True):
+    """Find first word exactly matching target."""
+    for w in words:
+        t = w["text"]
+        if case_insensitive:
+            if t.strip().lower() == target.strip().lower():
+                return w
+        else:
+            if t.strip() == target.strip():
+                return w
+    return None
+
+def find_phrase_bbox(words, phrase_tokens):
+    """
+    Find bbox for a phrase like ["Ship", "To:"] by matching sequential tokens
+    on same line (approx).
+    """
+    tokens = [p.lower() for p in phrase_tokens]
+    ws = sorted(words, key=lambda w: (w["top"], w["x0"]))
+    for i in range(len(ws) - len(tokens) + 1):
+        chunk = ws[i:i+len(tokens)]
+        if all(chunk[j]["text"].strip().lower() == tokens[j] for j in range(len(tokens))):
+            # ensure same line
+            if max(c["top"] for c in chunk) - min(c["top"] for c in chunk) <= 3:
+                x0 = min(c["x0"] for c in chunk)
+                x1 = max(c["x1"] for c in chunk)
+                top = min(c["top"] for c in chunk)
+                bottom = max(c["bottom"] for c in chunk)
+                return {"x0": x0, "x1": x1, "top": top, "bottom": bottom}
+    return None
 
 # -------------------------
-# SHIP TO (GREEN + RED) - FIXED
+# EXTRACTION: HEADER FIELDS
 # -------------------------
-def extract_ship_to(text: str):
+def extract_quote_number(text):
+    # Order Number QT...
+    m = re.search(r"Order Number\s+(QT[0-9A-Z]+)", text)
+    return m.group(1).strip() if m else ""
+
+def extract_customer_no(text):
+    m = re.search(r"Customer No\.\s+([0-9\-]+)", text)
+    return m.group(1).strip() if m else ""
+
+def extract_salesperson_code(text):
+    m = re.search(r"Salesperson\s+([A-Z]{1,4})\b", text)
+    return m.group(1).strip() if m else ""
+
+def extract_order_date(text):
+    # Prefer "Order Date" (orange)
+    m = re.search(r"Order Date\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})", text)
+    if m:
+        return format_date(m.group(1))
+    # Fallback to top "Date"
+    m = re.search(r"\bDate\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})", text)
+    return format_date(m.group(1)) if m else ""
+
+# -------------------------
+# EXTRACTION: SHIP TO (GREEN/RED) – robust
+# -------------------------
+def extract_ship_to_from_page(page):
     """
-    Company  = Ship To first line (GREEN)
-    Address  = Ship To second line (RED street)
-    City/State/Zip = Ship To third line (RED city line)
-    Country default USA (set Canada if detected)
+    Pull Ship To box using coordinates so Sold To doesn't bleed in.
+    - Company = first non-ATTN line (GREEN)
+    - Address = next non-ATTN line (RED street)
+    - City/State/Zip = next line (RED city line)
     """
     ship = {"Company":"","Address":"","City":"","State":"","ZipCode":"","Country":"USA"}
 
-    if not text:
+    words = page.extract_words(keep_blank_chars=False, use_text_flow=True)
+    if not words:
         return ship
 
-    # Capture Ship To block until next known section
-    m = re.search(
-        r"Ship To:\s*(.+?)(?:\n\s*Reference|\n\s*PO\s+Number|\n\s*Customer\s+No\.|\n\s*Salesperson|\n\s*Order Date)",
-        text,
-        flags=re.IGNORECASE | re.DOTALL
-    )
-    if not m:
-        # fallback (your old method)
-        m = re.search(r"Ship To:\s*(.+?)\n\s*\n", text, re.DOTALL)
-
-    if not m:
+    # Find "Ship To:" label bbox
+    bbox = find_phrase_bbox(words, ["Ship", "To:"])
+    if not bbox:
+        # sometimes it's "Ship" "To" without colon
+        bbox = find_phrase_bbox(words, ["Ship", "To"])
+    if not bbox:
         return ship
 
-    lines = [ln.strip() for ln in m.group(1).splitlines() if ln.strip()]
-    if not lines:
+    # Ship-to box is to the right half and below the label
+    x0 = bbox["x0"] - 5
+    x1 = page.width
+    y0 = bbox["bottom"] + 2
+    y1 = y0 + 130  # enough to include company+attn+address+cityline
+
+    block_words = [
+        w for w in words
+        if (w["x0"] >= x0 and w["x1"] <= x1 and w["top"] >= y0 and w["bottom"] <= y1)
+    ]
+
+    lines = group_words_into_lines(block_words, y_tol=3)
+
+    # Remove obvious non-address lines and skip ATTN
+    cleaned = []
+    for ln in lines:
+        t = ln.strip()
+        if not t:
+            continue
+        if t.lower().startswith("attn"):
+            continue
+        cleaned.append(t)
+
+    if not cleaned:
         return ship
 
-    # GREEN
-    ship["Company"] = lines[0]
+    ship["Company"] = cleaned[0]
 
-    # RED street
-    if len(lines) >= 2:
-        ship["Address"] = lines[1]
+    if len(cleaned) >= 2:
+        ship["Address"] = cleaned[1]
 
-    # RED city/state/zip line
-    if len(lines) >= 3:
-        cityline = lines[2]
+    if len(cleaned) >= 3:
+        cityline = cleaned[2]
 
-        # USA format: City, ST 12345 or City, ST 12345-6789
+        # USA: City, ST 12345 or 12345-6789
         us = re.search(r"^(.*?),\s*([A-Z]{2})\s*(\d{5}(?:-\d{4})?)$", cityline)
         if us:
             ship["City"] = us.group(1).strip()
@@ -97,7 +185,7 @@ def extract_ship_to(text: str):
             ship["ZipCode"] = us.group(3).strip()
             ship["Country"] = "USA"
         else:
-            # Canada format: City, PR A1A 1A1  (optional space)
+            # Canada: City, PR A1A 1A1
             ca = re.search(r"^(.*?),\s*([A-Z]{2})\s*([A-Z]\d[A-Z]\s?\d[A-Z]\d)$", cityline)
             if ca:
                 ship["City"] = ca.group(1).strip()
@@ -105,106 +193,132 @@ def extract_ship_to(text: str):
                 ship["ZipCode"] = ca.group(3).replace(" ", "").strip()
                 ship["Country"] = "Canada"
             else:
-                # If not matched, keep raw in City (better than wrong split)
+                # Last resort: keep raw in City
                 ship["City"] = cityline.strip()
 
-    # If a later line explicitly says Canada/USA, respect it
+    # If any line explicitly says Canada/USA
     for ln in lines:
-        if ln.lower() == "canada":
+        if ln.strip().lower() == "canada":
             ship["Country"] = "Canada"
-        if ln.lower() in ["usa", "united states", "united states of america"]:
+        if ln.strip().lower() in ["usa", "united states", "united states of america"]:
             ship["Country"] = "USA"
 
     return ship
 
 # -------------------------
-# LINE ITEMS (YELLOW + BROWN) - FIXED
+# EXTRACTION: LINE ITEMS (yellow/brown) – robust columns
 # -------------------------
-def parse_line_item_row(line: str):
+def extract_items_from_page(page):
     """
-    Handles both patterns:
-    1) Qty + Item Number + Customer Item Number + Description + Unit + Extended
-    2) Qty + Item Number + Description + Unit + Extended
-
-    Also handles multi-word Item Number like: PARTS & MISC
+    Extract items from the table by column positions:
+    Qty | Item Number | (Customer Item Number) | Description | Unit Price | Extended Price
     """
-    prices = MONEY_RE.findall(line)
-    if len(prices) < 2:
-        return None
-
-    unit_price = money(prices[-2])
-    ext_price = money(prices[-1])
-
-    # remove last two money values from the end safely
-    tmp = line.rsplit(prices[-1], 1)[0].strip()
-    tmp = tmp.rsplit(prices[-2], 1)[0].strip()
-
-    parts = tmp.split()
-    if len(parts) < 2:
-        return None
-
-    qty = parts[0]
-
-    # Item Number (YELLOW) can be "PARTS & MISC"
-    item_id = ""
-    rest = []
-
-    if len(parts) >= 4 and parts[1] == "PARTS" and parts[2] == "&" and parts[3] == "MISC":
-        item_id = "PARTS & MISC"
-        rest = parts[4:]
-    else:
-        item_id = parts[1]
-        rest = parts[2:]
-
-    # Sometimes there is a Customer Item Number column (often has dash)
-    customer_item = ""
-    if rest and ("-" in rest[0] or re.match(r"^[A-Z0-9]{3,}$", rest[0])):
-        # We only treat it as customer item if the PDF actually uses that column
-        # Many Alcorn PDFs show it, and it's usually a short code.
-        # But we must not steal the first word of the description if there is no column.
-        # Rule: if next token looks like a code AND there are still words after it, treat as customer item.
-        if len(rest) >= 2:
-            customer_item = rest[0]
-            rest = rest[1:]
-
-    # Description (BROWN)
-    item_desc = " ".join(([customer_item] if customer_item else []) + rest).strip()
-
-    return {
-        "Quantity": qty,
-        "item_id": item_id,
-        "item_desc": item_desc,
-        "Unit Price": unit_price,
-        "TotalSales": ext_price,
-        "UOM": ""
-    }
-
-def extract_items(text: str):
-    if not text:
+    words = page.extract_words(keep_blank_chars=False, use_text_flow=True)
+    if not words:
         return []
 
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    # Find table header words
+    hdr_qty = find_phrase_bbox(words, ["Qty."])
+    if not hdr_qty:
+        hdr_qty = find_phrase_bbox(words, ["Qty."])  # same call, kept for clarity
 
-    # Find start of items table
-    start = None
-    for i, l in enumerate(lines):
-        if l.startswith("Qty.") and "Item Number" in l:
-            start = i + 1
-            break
+    hdr_item = find_phrase_bbox(words, ["Item", "Number"])
+    hdr_desc = find_phrase_bbox(words, ["Description"])
+    hdr_unit = find_phrase_bbox(words, ["Unit", "Price"])
+    hdr_ext  = find_phrase_bbox(words, ["Extended", "Price"])
 
-    if start is None:
+    if not (hdr_item and hdr_desc and hdr_unit and hdr_ext):
         return []
+
+    # Column boundaries (x)
+    x_qty0 = 0
+    x_qty1 = hdr_item["x0"] - 4
+
+    x_item0 = hdr_item["x0"] - 2
+    x_item1 = hdr_desc["x0"] - 6  # includes Customer Item Number column if present
+
+    x_desc0 = hdr_desc["x0"] - 2
+    x_desc1 = hdr_unit["x0"] - 6
+
+    x_unit0 = hdr_unit["x0"] - 2
+    x_unit1 = hdr_ext["x0"] - 6
+
+    x_ext0  = hdr_ext["x0"] - 2
+    x_ext1  = page.width
+
+    # Rows start below header line
+    y_start = max(hdr_item["bottom"], hdr_desc["bottom"], hdr_unit["bottom"], hdr_ext["bottom"]) + 2
+    y_end = page.height  # stop naturally when no prices found
+
+    body_words = [w for w in words if w["top"] >= y_start and w["bottom"] <= y_end]
+
+    # Group into row lines by y
+    row_lines = []
+    body_words = sorted(body_words, key=lambda w: (w["top"], w["x0"]))
+    current = []
+    last_top = None
+    for w in body_words:
+        if last_top is None or abs(w["top"] - last_top) <= 3:
+            current.append(w)
+            last_top = w["top"] if last_top is None else last_top
+        else:
+            row_lines.append(current)
+            current = [w]
+            last_top = w["top"]
+    if current:
+        row_lines.append(current)
 
     items = []
-    for l in lines[start:]:
-        if l.lower().startswith("comments"):
+    for row in row_lines:
+        # Build cell texts by column range
+        def cell_text(x0, x1):
+            ws = [w for w in row if w["x0"] >= x0 and w["x1"] <= x1]
+            ws = sorted(ws, key=lambda w: w["x0"])
+            return " ".join(w["text"] for w in ws).strip()
+
+        qty_txt  = cell_text(x_qty0, x_qty1)
+        item_txt = cell_text(x_item0, x_item1)
+        desc_txt = cell_text(x_desc0, x_desc1)
+        unit_txt = cell_text(x_unit0, x_unit1)
+        ext_txt  = cell_text(x_ext0,  x_ext1)
+
+        # stop at footer / blanks
+        if not (qty_txt or item_txt or desc_txt or unit_txt or ext_txt):
+            continue
+        if "comments" in (desc_txt or "").lower():
             break
-        if not re.match(r"^\d+\s", l):
+
+        # must have prices to be a valid item row
+        unit_m = MONEY_RE.search(unit_txt or "")
+        ext_m = MONEY_RE.search(ext_txt or "")
+        if not (unit_m and ext_m):
             continue
 
-        parsed = parse_line_item_row(l)
-        if parsed:
-            items.append(parsed)
+        # Quantity should be numeric
+        qty_m = re.search(r"\d+", qty_txt or "")
+        if not qty_m:
+            continue
+
+        qty = qty_m.group(0)
+
+        # item_id: take full item number cell (yellow)
+        # normalize multiple spaces
+        item_id = " ".join((item_txt or "").split()).strip()
+
+        # item_desc: take description cell (brown)
+        item_desc = " ".join((desc_txt or "").split()).strip()
+
+        if not item_id or not item_desc:
+            continue
+
+        items.append({
+            "Quantity": qty,
+            "item_id": item_id,
+            "item_desc": item_desc,
+            "Unit Price": money(unit_m.group(0)),
+            "TotalSales": money(ext_m.group(0)),
+            "UOM": ""
+        })
 
     return items
 
@@ -218,57 +332,27 @@ def extract_from_pdf(pdf_bytes, pdf_name):
         page = pdf.pages[0]
         text = page.extract_text() or ""
 
-        # -------------------------
-        # QUOTE NUMBER
-        # -------------------------
-        quote = ""
-        m = re.search(r"Order Number\s+(QT[0-9A-Z]+)", text)
-        if m:
-            quote = m.group(1)
+        quote = extract_quote_number(text)             # light green
+        quote_date = extract_order_date(text)          # orange (Order Date preferred)
+        cust = extract_customer_no(text)               # blue
+        salesperson = extract_salesperson_code(text)   # silver
 
-        # -------------------------
-        # QUOTE DATE
-        # -------------------------
-        quote_date = ""
-        d = re.search(r"Date\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})", text)
-        if d:
-            quote_date = format_date(d.group(1))
+        ship = extract_ship_to_from_page(page)         # green/red from Ship To box
+        items = extract_items_from_page(page)          # yellow/brown from table columns
 
-        # -------------------------
-        # CUSTOMER NUMBER / SALESPERSON
-        # -------------------------
-        cust = ""
-        salesperson = ""
-
-        m = re.search(r"Customer No\.\s+([0-9\-]+)", text)
-        if m:
-            cust = m.group(1)
-
-        s = re.search(r"Salesperson\s+([A-Z]+)", text)
-        if s:
-            salesperson = s.group(1)
-
-        # -------------------------
-        # SHIP TO (GREEN + RED) FIXED
-        # -------------------------
-        ship = extract_ship_to(text)
-
-        # -------------------------
-        # LINE ITEMS (YELLOW + BROWN) FIXED
-        # -------------------------
-        items = extract_items(text)
         if not items:
             return []
 
         for it in items:
             r = blank_row()
             r["Brand"] = "Alcorn Industrial Inc"
+
             r["QuoteNumber"] = quote
             r["QuoteDate"] = quote_date
+
             r["Customer Number/ID"] = cust
             r["ReferralManagerCode"] = salesperson
 
-            # Ship To mapping
             r["Company"] = ship["Company"]
             r["Address"] = ship["Address"]
             r["City"] = ship["City"]
@@ -276,7 +360,6 @@ def extract_from_pdf(pdf_bytes, pdf_name):
             r["ZipCode"] = ship["ZipCode"]
             r["Country"] = ship["Country"]
 
-            # Line mapping
             r["item_id"] = it["item_id"]
             r["item_desc"] = it["item_desc"]
             r["Quantity"] = it["Quantity"]
